@@ -1,4 +1,13 @@
-"""法律证据保管与流转后台。"""
+"""法律证据保管与流转后台。
+
+分层维护：
+- errors.py：业务错误；
+- retention.py：期限规则（纯规则，不接触存储）；
+- reviews.py：期限复核服务（提交、审批、批准前再核对、事件追加）；
+- migrations.py：事件迁移与旧库升级；
+- app.py：存储与 HTTP 路由层；
+- web/index.html：页面交互。
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,15 +22,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from errors import BusinessError
+from migrations import init_or_migrate
+from reviews import ReviewService
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "custody.db"
 MEMBER_ROLES = {"custodian", "analyst", "auditor"}
-
-
-class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
-        super().__init__(message)
-        self.message, self.status, self.code = message, status, code
 
 
 def now():
@@ -32,6 +39,7 @@ class CustodyStore:
     def __init__(self, db_path=DEFAULT_DB):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        self.reviews = ReviewService(self)
 
     def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -41,57 +49,10 @@ class CustodyStore:
         return conn
 
     def init_schema(self):
-        with self._lock, self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users(
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
-                );
-                CREATE TABLE IF NOT EXISTS cases(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, case_number TEXT NOT NULL UNIQUE,
-                    title TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS case_members(
-                    case_id INTEGER NOT NULL REFERENCES cases(id), user_id TEXT NOT NULL REFERENCES users(id),
-                    role TEXT NOT NULL CHECK(role IN ('custodian','analyst','auditor')),
-                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-                    granted_by TEXT NOT NULL REFERENCES users(id), granted_at TEXT NOT NULL,
-                    PRIMARY KEY(case_id,user_id)
-                );
-                CREATE TABLE IF NOT EXISTS evidence(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    case_id INTEGER NOT NULL REFERENCES cases(id), label TEXT NOT NULL,
-                    filename TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
-                    content BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'custody'
-                        CHECK(status IN ('custody','opened','released','derivative')),
-                    current_custodian TEXT NOT NULL, legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0,1)),
-                    retention_until TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL, UNIQUE(case_id,label)
-                );
-                CREATE TABLE IF NOT EXISTS custody_events(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    evidence_id INTEGER NOT NULL REFERENCES evidence(id), sequence INTEGER NOT NULL,
-                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED')),
-                    actor_id TEXT NOT NULL REFERENCES users(id), from_person TEXT,
-                    to_person TEXT, location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
-                    previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL, UNIQUE(evidence_id,sequence)
-                );
-                CREATE TABLE IF NOT EXISTS derivatives(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_evidence_id INTEGER NOT NULL REFERENCES evidence(id),
-                    child_evidence_id INTEGER NOT NULL UNIQUE REFERENCES evidence(id),
-                    method TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL, UNIQUE(parent_evidence_id,child_evidence_id)
-                );
-                CREATE TABLE IF NOT EXISTS audit_log(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    case_id INTEGER NOT NULL REFERENCES cases(id), actor_id TEXT NOT NULL REFERENCES users(id),
-                    action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
-                );
-                """
-            )
+        """初始化新库或升级旧库；旧库升级时迁移全部保管事件，保留原编号与哈希。"""
+        with self._lock:
+            migrated = init_or_migrate(self.db_path)
+        return migrated
 
     def seed(self):
         self.init_schema()
@@ -246,9 +207,19 @@ class CustodyStore:
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
+            result["retention_reviews"] = [
+                self._serialize_review(r)
+                for r in conn.execute("SELECT * FROM retention_reviews WHERE evidence_id=? ORDER BY id", (evidence_id,)).fetchall()
+            ]
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
             return result
+
+    @staticmethod
+    def _serialize_review(row):
+        data = dict(row)
+        data["legal_hold_snapshot"] = bool(data["legal_hold_snapshot"])
+        return data
 
     def transfer(self, user_id, evidence_id, to_person, location, note=""):
         if not to_person.strip() or not location.strip():
@@ -375,6 +346,10 @@ class CustodyStore:
                         chain_valid = False
                     expected_prev = e["event_hash"]
                 all_valid = all_valid and hash_valid and chain_valid
+                # 期限复核记录原样保留：原日期、申请内容、处理结果（含拒绝原因）。
+                reviews = conn.execute(
+                    "SELECT * FROM retention_reviews WHERE evidence_id=? ORDER BY id", (row["id"],)
+                ).fetchall()
                 items.append({
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
@@ -382,6 +357,7 @@ class CustodyStore:
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
+                    "retention_reviews": [self._serialize_review(r) for r in reviews],
                 })
             audit = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
             return {
@@ -420,6 +396,8 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201,store.ingest_evidence(user,int(parts[2]),d.get("label",""),d.get("filename",""),d.get("content_b64",""),d.get("retention_until",""),d.get("custodian")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="report" and method=="GET":
             return self._send(200,store.report(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="retention-reviews" and method=="GET":
+            return self._send(200,store.reviews.list_for_case(user,int(parts[2])))
         if len(parts)>=3 and parts[:2]==["api","evidence"]:
             evidence_id=int(parts[2])
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
@@ -430,6 +408,13 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[3]=="derive": return self._send(201,store.derive(user,evidence_id,d.get("method",""),d.get("label",""),d.get("filename",""),d.get("content_b64","")))
                 if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note","")))
                 if parts[3]=="hold": return self._send(200,store.set_hold(user,evidence_id,bool(d.get("hold")),d.get("reason","")))
+                if parts[3]=="retention-reviews":
+                    return self._send(201,store.reviews.submit(user,evidence_id,d.get("review_type",""),d.get("new_retention_until",""),d.get("reason","")))
+            if len(parts)==5 and parts[3]=="retention-reviews" and method=="GET":
+                return self._send(200,store.reviews.list_for_evidence(user,evidence_id))
+        if parts[:2]==["api","retention-reviews"] and len(parts)==3 and method=="POST":
+            d=self._body()
+            return self._send(200,store.reviews.decide(user,int(parts[2]),bool(d.get("approve")),d.get("decision_note","")))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
@@ -451,9 +436,11 @@ def main():
     parser=argparse.ArgumentParser(description="法律证据保管与流转后台")
     parser.add_argument("--db",default=str(DEFAULT_DB)); parser.add_argument("--port",type=int,default=8105)
     parser.add_argument("--init",action="store_true"); parser.add_argument("--seed",action="store_true")
-    args=parser.parse_args(); store=CustodyStore(args.db); store.init_schema()
+    args=parser.parse_args(); store=CustodyStore(args.db); migrated=store.init_schema()
     if args.seed: store.seed()
-    if args.init or args.seed: print(f"数据库已初始化: {args.db}"); return
+    if args.init or args.seed:
+        print(f"数据库已初始化: {args.db}" + (f"；旧库迁移保管事件 {migrated} 条" if migrated else ""))
+        return
     server=CustodyServer(("127.0.0.1",args.port),store); print(f"证据保管系统运行于 http://127.0.0.1:{args.port}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass

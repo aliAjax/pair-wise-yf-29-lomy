@@ -1,4 +1,179 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>法律证据保管 · 期限复核</title>
+<style>
+  body{font:15px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1060px;margin:24px auto;padding:0 16px;color:#222}
+  h1{font-size:22px} h2{font-size:17px;margin:20px 0 8px}
+  .panel{border:1px solid #bbb;border-radius:8px;padding:14px 16px;margin:12px 0;background:#fff}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+  select,input,button,textarea{padding:7px 9px;border:1px solid #999;border-radius:5px;font:inherit}
+  textarea{width:100%;box-sizing:border-box}
+  button{cursor:pointer;background:#f3f3f3} button:hover{background:#e4e4e4}
+  button.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+  button.danger{background:#cf222e;color:#fff;border-color:#cf222e}
+  pre{background:#f5f5f5;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto}
+  table{border-collapse:collapse;width:100%;font-size:14px}
+  th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f0f0f0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+  .pending{background:#9a6700}.approved{background:#1a7f37}.rejected{background:#cf222e}
+  .extend{background:#0969da}.shorten{color:#000}
+  .muted{color:#666;font-size:13px}
+  .reject-reason{color:#cf222e}
+  #msg{margin:8px 0;padding:8px 12px;border-radius:6px;display:none}
+  #msg.ok{background:#dafbe1;border:1px solid #1a7f37;display:block}
+  #msg.err{background:#ffebe9;border:1px solid #cf222e;display:block}
+</style>
+</head>
+<body>
+<h1>法律证据保管与流转 · 保留期限复核</h1>
+
+<div class="panel">
+  <div class="row">
+    <strong>当前身份：</strong>
+    <select id="user">
+      <option value="custodian1">custodian1（保管员 / 案件创建人）</option>
+      <option value="custodian2">custodian2（保管员）</option>
+      <option value="analyst1">analyst1（分析员）</option>
+      <option value="auditor1">auditor1（审计员）</option>
+      <option value="outsider">outsider（外部人员）</option>
+    </select>
+    <span class="muted">保管员可提交；案件创建人或审计员可处理；提交人不能自批</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>保管员提交期限复核（延期 / 提前结束）</h2>
+  <div class="row">
+    <label>证据编号 <input id="evId" type="number" min="1" value="1" style="width:90px"></label>
+    <label>类型
+      <select id="rvType">
+        <option value="extend">extend 延期</option>
+        <option value="shorten">shorten 提前结束</option>
+      </select>
+    </label>
+    <label>新到期日 <input id="rvDate" type="date"></label>
+  </div>
+  <div class="row"><textarea id="rvReason" rows="2" placeholder="变更原因（至少 5 字）"></textarea></div>
+  <div class="row"><button class="primary" onclick="submitReview()">提交复核申请</button>
+    <button onclick="loadEvidence()">查看该证据</button></div>
+</div>
+
+<div class="panel">
+  <h2>案件创建人 / 审计员处理在途申请</h2>
+  <div class="row">
+    <label>申请编号 <input id="rvId" type="number" min="1" style="width:100px"></label>
+  </div>
+  <div class="row"><textarea id="rvNote" rows="2" placeholder="批准备注（可选）/ 拒绝时必须填写拒绝原因"></textarea></div>
+  <div class="row">
+    <button class="primary" onclick="decide(true)">批准</button>
+    <button class="danger" onclick="decide(false)">拒绝（需填原因）</button>
+    <button onclick="loadCaseReviews()">刷新案件申请列表</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>案件视角</h2>
+  <div class="row">
+    <label>案件编号 <input id="caseId" type="number" min="1" value="1" style="width:90px"></label>
+    <button onclick="loadCaseReviews()">查看期限复核列表</button>
+    <button onclick="loadReport()">生成完整保管报告</button>
+  </div>
+  <table id="reviewsTable" style="display:none">
+    <thead><tr>
+      <th>申请#</th><th>证据</th><th>类型</th><th>原到期日</th><th>新到期日</th>
+      <th>提交人 / 时间</th><th>原因</th><th>状态 / 处理结果</th>
+    </tr></thead>
+    <tbody id="reviewsBody"></tbody>
+  </table>
+</div>
+
+<div id="msg"></div>
+<pre id="out" class="muted">操作结果将显示在这里。</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = () => ({'Content-Type':'application/json','X-User-Id':$('user').value});
+
+function showMsg(ok, text){
+  const m = $('msg');
+  m.className = ok ? 'ok' : 'err';
+  m.textContent = text;
+}
+function show(data){ $('out').textContent = JSON.stringify(data, null, 2); }
+
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(() => ({}));
+  if(!r.ok){ showMsg(false, `错误 ${r.status}：${data.error?.code ?? ''} ${data.error?.message ?? r.statusText}`); throw new Error('api failed'); }
+  return data;
+}
+
+async function submitReview(){
+  const body = {
+    review_type: $('rvType').value,
+    new_retention_until: $('rvDate').value,
+    reason: $('rvReason').value,
+  };
+  const data = await api(`/api/evidence/${$('evId').value}/retention-reviews`, {method:'POST', headers:headers(), body:JSON.stringify(body)});
+  showMsg(true, `申请已提交，编号 #${data.id}，状态 ${data.status}`);
+  show(data);
+  $('rvId').value = data.id;
+}
+
+async function decide(approve){
+  const body = {approve, decision_note: $('rvNote').value};
+  const data = await api(`/api/retention-reviews/${$('rvId').value}`, {method:'POST', headers:headers(), body:JSON.stringify(body)});
+  showMsg(true, approve ? `申请 #${data.id} 已批准，到期日更新为 ${data.new_retention_until}` : `申请 #${data.id} 已拒绝`);
+  show(data);
+  loadCaseReviews();
+}
+
+async function loadEvidence(){
+  const data = await api(`/api/evidence/${$('evId').value}`, {headers:{'X-User-Id':$('user').value}});
+  show(data);
+}
+
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function renderReviews(list){
+  if(!list.length){ $('reviewsTable').style.display='none'; showMsg(true,'该案件暂无期限复核申请'); return; }
+  $('reviewsTable').style.display='';
+  $('reviewsBody').innerHTML = list.map(r => `
+    <tr>
+      <td>#${r.id}</td>
+      <td>#${r.evidence_id}${r.evidence_label ? ' '+esc(r.evidence_label) : ''}</td>
+      <td>${r.review_type === 'extend'
+          ? '<span class="tag extend">延期</span>'
+          : '<b style="color:#9a6700">提前结束</b>'}</td>
+      <td>${esc(r.current_retention_until)}${r.previous_retention_until ? `<div class="muted">批准前：${esc(r.previous_retention_until)}</div>`:''}</td>
+      <td>${esc(r.new_retention_until)}</td>
+      <td>${esc(r.submitted_by)}（${esc(r.submitter_role)}）<div class="muted">${esc(r.submitted_at)}</div></td>
+      <td>${esc(r.reason)}</td>
+      <td><span class="tag ${r.status}">${r.status === 'pending' ? '待处理' : r.status === 'approved' ? '已批准' : '已拒绝'}</span>
+          ${r.decided_by ? `<div class="muted">处理人：${esc(r.decided_by)} ${esc(r.decided_at ?? '')}</div>` : ''}
+          ${r.status === 'rejected' ? `<div class="reject-reason">拒绝原因：${esc(r.decision_note)}</div>`
+            : (r.decision_note ? `<div class="muted">备注：${esc(r.decision_note)}</div>` : '')}
+      </td>
+    </tr>`).join('');
+}
+
+async function loadCaseReviews(){
+  const data = await api(`/api/cases/${$('caseId').value}/retention-reviews`, {headers:{'X-User-Id':$('user').value}});
+  renderReviews(data);
+  show(data);
+}
+
+async function loadReport(){
+  const data = await api(`/api/cases/${$('caseId').value}/report`, {headers:{'X-User-Id':$('user').value}});
+  // 报告中原日期、申请和处理结果随每条证据的 retention_reviews 一并导出。
+  const list = (data.evidence ?? []).flatMap(e => (e.retention_reviews ?? []).map(r => ({...r, evidence_label:e.label})));
+  renderReviews(list);
+  show(data);
+}
+</script>
+</body>
+</html>
