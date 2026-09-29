@@ -1,4 +1,44 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>法律证据保管 · 保留期限复核</title>
+<style>
+  body{font:15px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1060px;margin:24px auto;padding:0 16px;color:#222}
+  h1{font-size:22px} h2{font-size:16px;margin:18px 0 8px}
+  select,input,button,textarea{padding:7px 9px;margin:3px 4px 3px 0;border:1px solid #999;border-radius:5px;font:inherit}
+  button{cursor:pointer;background:#f3f3f3} button.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
+  button.danger{background:#b91c1c;color:#fff;border-color:#b91c1c}
+  .panel{border:1px solid #bbb;border-radius:8px;padding:14px;margin-bottom:14px;background:#fafafa}
+  .card{border:1px solid #ccc;border-radius:8px;padding:12px;margin:10px 0;background:#fff}
+  .muted{color:#666}.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-left:6px}
+  .tag.hold{background:#fee2e2}.tag.ok{background:#dcfce7}.tag.pending{background:#fef9c3}.tag.rejected{background:#fee2e2}.tag.approved{background:#dcfce7}
+  .reject-reason{color:#b91c1c;background:#fef2f2;border-left:3px solid #b91c1c;padding:6px 10px;margin:6px 0;border-radius:0 4px 4px 0;white-space:pre-wrap}
+  .flash{padding:10px 12px;border-radius:6px;margin:10px 0;white-space:pre-wrap}
+  .flash.err{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
+  .flash.info{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}
+  table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
+  td,th{border:1px solid #ddd;padding:5px 7px;text-align:left;vertical-align:top}
+  .review-form{display:none;border-top:1px dashed #ccc;margin-top:8px;padding-top:8px}
+  .chain{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+</style>
+</head>
+<body>
+<h1>法律证据保管与流转 · 保留期限复核</h1>
+<div class="panel">
+  <label>当前身份
+    <select id="user">
+      <option>custodian1</option><option>custodian2</option>
+      <option>analyst1</option><option>auditor1</option><option>outsider</option>
+    </select>
+  </label>
+  <label>案件 ID <input id="case" value="1" size="5"></label>
+  <button class="primary" onclick="loadReport()">生成保管报告</button>
+  <button onclick="loadPending()">看待处理申请</button>
+</div>
+<div id="flash"></div>
+<div id="content" class="panel" style="display:none"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -8,30 +8,32 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from errors import BusinessError, now
+from retention_reviews import RetentionReviewService
+import schema_migrations
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "custody.db"
 MEMBER_ROLES = {"custodian", "analyst", "auditor"}
 
 
-class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
-        super().__init__(message)
-        self.message, self.status, self.code = message, status, code
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 class CustodyStore:
     def __init__(self, db_path=DEFAULT_DB):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        self._reviews = None
+
+    @property
+    def reviews(self):
+        # 复核服务独立维护，存储层通过该属性访问。
+        if self._reviews is None:
+            self._reviews = RetentionReviewService(self)
+        return self._reviews
 
     def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -41,57 +43,10 @@ class CustodyStore:
         return conn
 
     def init_schema(self):
-        with self._lock, self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users(
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
-                );
-                CREATE TABLE IF NOT EXISTS cases(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, case_number TEXT NOT NULL UNIQUE,
-                    title TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS case_members(
-                    case_id INTEGER NOT NULL REFERENCES cases(id), user_id TEXT NOT NULL REFERENCES users(id),
-                    role TEXT NOT NULL CHECK(role IN ('custodian','analyst','auditor')),
-                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-                    granted_by TEXT NOT NULL REFERENCES users(id), granted_at TEXT NOT NULL,
-                    PRIMARY KEY(case_id,user_id)
-                );
-                CREATE TABLE IF NOT EXISTS evidence(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    case_id INTEGER NOT NULL REFERENCES cases(id), label TEXT NOT NULL,
-                    filename TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
-                    content BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'custody'
-                        CHECK(status IN ('custody','opened','released','derivative')),
-                    current_custodian TEXT NOT NULL, legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0,1)),
-                    retention_until TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL, UNIQUE(case_id,label)
-                );
-                CREATE TABLE IF NOT EXISTS custody_events(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    evidence_id INTEGER NOT NULL REFERENCES evidence(id), sequence INTEGER NOT NULL,
-                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED')),
-                    actor_id TEXT NOT NULL REFERENCES users(id), from_person TEXT,
-                    to_person TEXT, location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
-                    previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL, UNIQUE(evidence_id,sequence)
-                );
-                CREATE TABLE IF NOT EXISTS derivatives(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_evidence_id INTEGER NOT NULL REFERENCES evidence(id),
-                    child_evidence_id INTEGER NOT NULL UNIQUE REFERENCES evidence(id),
-                    method TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL, UNIQUE(parent_evidence_id,child_evidence_id)
-                );
-                CREATE TABLE IF NOT EXISTS audit_log(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    case_id INTEGER NOT NULL REFERENCES cases(id), actor_id TEXT NOT NULL REFERENCES users(id),
-                    action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
-                );
-                """
-            )
+        # 结构升级与事件迁移统一走 schema_migrations：
+        # 全新库直接建到最新，老库重建事件表但保留全部哈希。
+        with self._lock:
+            schema_migrations.migrate(self.db_path)
 
     def seed(self):
         self.init_schema()
@@ -216,9 +171,9 @@ class CustodyStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.execute(
-                    """INSERT INTO evidence(case_id,label,filename,sha256,size,content,current_custodian,retention_until,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (case_id, label, filename, digest, len(content), content, custodian, retention_until, user_id, now()),
+                    """INSERT INTO evidence(case_id,label,filename,sha256,size,content,current_custodian,retention_until,original_retention_until,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (case_id, label, filename, digest, len(content), content, custodian, retention_until, retention_until, user_id, now()),
                 )
                 evidence_id = cur.lastrowid
                 self._append_event(conn, evidence_id, "INGEST", user_id, to_person=custodian, note=f"入册 SHA-256 {digest}")
@@ -245,6 +200,7 @@ class CustodyStore:
             result["legal_hold"] = bool(row["legal_hold"])
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
+            result["retention_reviews"] = self.reviews.rows_for_evidence(conn, evidence_id)
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
@@ -302,9 +258,9 @@ class CustodyStore:
                 if parent["status"] != "opened":
                     raise BusinessError("原始证据必须先开箱才能分析", 409, "evidence_not_opened")
                 cur = conn.execute(
-                    """INSERT INTO evidence(case_id,label,filename,sha256,size,content,status,current_custodian,legal_hold,retention_until,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (parent["case_id"], label.strip(), filename.strip(), digest, len(content), content, "derivative", user_id, 0, parent["retention_until"], user_id, now()),
+                    """INSERT INTO evidence(case_id,label,filename,sha256,size,content,status,current_custodian,legal_hold,retention_until,original_retention_until,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (parent["case_id"], label.strip(), filename.strip(), digest, len(content), content, "derivative", user_id, 0, parent["retention_until"], parent["retention_until"], user_id, now()),
                 )
                 child_id = cur.lastrowid
                 conn.execute(
@@ -379,8 +335,11 @@ class CustodyStore:
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
+                    # 报告保留原日期：最初入册时的期限不随复核结果被盖掉。
+                    "original_retention_until": row["original_retention_until"] or row["retention_until"],
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
+                    "retention_reviews": self.reviews.rows_for_evidence(conn, row["id"]),
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
                 })
             audit = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
@@ -412,6 +371,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(body)))
             self.end_headers(); self.wfile.write(body); return
         if method=="GET" and path=="/health": return self._send(200,{"ok":True})
+        if method=="GET" and path=="/static/app.js":
+            body=(BASE_DIR/"web"/"app.js").read_bytes(); self.send_response(200)
+            self.send_header("Content-Type","application/javascript; charset=utf-8")
+            self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-cache")
+            self.end_headers(); self.wfile.write(body); return
         if parts==["api","cases"] and method=="POST":
             d=self._body(); return self._send(201,store.create_case(user,d.get("case_number",""),d.get("title","")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="members" and method=="POST":
@@ -420,9 +384,19 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201,store.ingest_evidence(user,int(parts[2]),d.get("label",""),d.get("filename",""),d.get("content_b64",""),d.get("retention_until",""),d.get("custodian")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="report" and method=="GET":
             return self._send(200,store.report(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="retention-reviews" and method=="GET":
+            status=parse_qs(urlparse(self.path).query).get("status",[""])[0]
+            return self._send(200,store.reviews.list_for_case(user,int(parts[2]),status))
+        if len(parts)==3 and parts[:2]==["api","retention-reviews"] and method=="GET":
+            return self._send(200,store.reviews.get(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","retention-reviews"] and parts[3]=="decision" and method=="POST":
+            d=self._body()
+            return self._send(200,store.reviews.decide(user,int(parts[2]),bool(d.get("approve")),d.get("decision_note","")))
         if len(parts)>=3 and parts[:2]==["api","evidence"]:
             evidence_id=int(parts[2])
-            if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
+            if len(parts)==3 and method=="GET":
+                include=parse_qs(urlparse(self.path).query).get("content",[""])[0]
+                return self._send(200,store.get_evidence(user,evidence_id,include in ("1","true","yes")))
             if len(parts)==4 and method=="POST":
                 d=self._body()
                 if parts[3]=="transfer": return self._send(200,store.transfer(user,evidence_id,d.get("to_person",""),d.get("location",""),d.get("note","")))
@@ -430,6 +404,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[3]=="derive": return self._send(201,store.derive(user,evidence_id,d.get("method",""),d.get("label",""),d.get("filename",""),d.get("content_b64","")))
                 if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note","")))
                 if parts[3]=="hold": return self._send(200,store.set_hold(user,evidence_id,bool(d.get("hold")),d.get("reason","")))
+                if parts[3]=="retention-reviews":
+                    return self._send(201,store.reviews.submit(user,evidence_id,d.get("request_type",""),d.get("new_retention_until",""),d.get("reason","")))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
